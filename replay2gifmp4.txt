@@ -1,0 +1,342 @@
+// ==UserScript==
+// @name         replay 2 gif/mp4
+// @namespace    http://tampermonkey.net/
+// @version      2025-07-07
+// @description  records whole screen, so zoom in first. colors may flicker. speed may be lower than attempted setting. settings: format(gif/mp4), turns(ticks), ms/frame(500=normal), playback speed(1=normal). gif=slow+big+wronger colors
+// @author       bimber
+// @match        https://generals.io/replays/*
+// @match        https://*.generals.io/replays/*
+// @icon         data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==
+// @grant        none
+// ==/UserScript==
+
+(async function setupCaptureUIWithFormatOptions() {
+  // Load html2canvas if missing
+  if (typeof html2canvas === 'undefined') {
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+    document.head.appendChild(script);
+    await new Promise(res => script.onload = res);
+  }
+
+  // Load gif.js and worker blob if needed
+  async function loadGifLib() {
+    if (!window.gifWorkerBlobUrl) {
+      const gifScript = document.createElement('script');
+      gifScript.src = 'https://cdn.jsdelivr.net/npm/gif.js.optimized/dist/gif.js';
+      document.head.appendChild(gifScript);
+      await new Promise(res => gifScript.onload = res);
+      const blob = await fetch('https://cdn.jsdelivr.net/npm/gif.js.optimized/dist/gif.worker.js').then(r => r.blob());
+      window.gifWorkerBlobUrl = URL.createObjectURL(blob);
+    }
+  }
+
+  // Build UI Panel
+  const panel = document.createElement('div');
+  panel.id = 'capture-control-panel-wrapper';
+  panel.innerHTML = `
+    <style>
+      #capture-control-panel {
+        position: fixed;
+        top: 20px;
+        left: 150px;
+        background: #1e1e1e;
+        color: white;
+        font-family: sans-serif;
+        padding: 12px;
+        border-radius: 8px;
+        z-index: 999999;
+        box-shadow: 0 0 10px rgba(0,0,0,0.5);
+        user-select: none;
+      }
+      #capture-control-panel input, #capture-control-panel select {
+        width: 70px;
+        margin-right: 8px;
+        padding: 2px 6px;
+        background: #222;
+        border: 1px solid #444;
+        color: white;
+        border-radius: 4px;
+      }
+      #capture-control-panel label {
+        display: inline-flex;
+        align-items: center;
+        margin-bottom: 6px;
+        font-size: 14px;
+      }
+      #capture-control-panel button {
+        margin-top: 8px;
+        width: 100%;
+        padding: 6px;
+        background: #00cc88;
+        color: black;
+        border: none;
+        border-radius: 4px;
+        font-weight: bold;
+        cursor: pointer;
+      }
+      #capture-control-panel .checkbox-label {
+        cursor: pointer;
+        user-select: none;
+      }
+    </style>
+    <div id="capture-control-panel">
+      <label>Format:
+        <select id="formatSelect">
+          <option value="gif" selected>GIF</option>
+          <option value="mp4">MP4</option>
+        </select>
+      </label><br>
+      <label>Turns: <input id="turnsInput" type="number" value="10" min="1"></label><br>
+      <label id="clickDelayLabel">ms/frame: <input id="clickDelayInput" type="number" value="500" min="10"></label><br>
+      <label id="playbackSpeedLabel" style="display:none;">Playback Speed (x): <input id="playbackSpeedInput" type="number" value="1" min="0.1" step="0.1"></label><br>
+      <label class="checkbox-label"><input type="checkbox" id="hideUIPanelCheckbox"> Hide UI during recording</label><br>
+      <label class="checkbox-label"><input type="checkbox" id="showProgressCheckbox" checked> Show progress overlay</label><br>
+      <button id="startCaptureBtn">🎬 Start Recording</button>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  const formatSelect = document.getElementById('formatSelect');
+  const clickDelayLabel = document.getElementById('clickDelayLabel');
+  const clickDelayInput = document.getElementById('clickDelayInput');
+  const playbackSpeedLabel = document.getElementById('playbackSpeedLabel');
+
+  formatSelect.addEventListener('change', () => {
+    const isGif = formatSelect.value === 'gif';
+    clickDelayLabel.style.display = isGif ? 'inline-block' : 'none';
+    playbackSpeedLabel.style.display = isGif ? 'none' : 'inline-block';
+    if (!isGif) clickDelayInput.value = 100;
+  });
+
+  document.getElementById('startCaptureBtn').onclick = async () => {
+    const format = formatSelect.value;
+    const turns = parseInt(document.getElementById('turnsInput')?.value || 10, 10);
+    let clickDelay = parseInt(clickDelayInput?.value || 500, 10);
+    const playbackSpeed = parseFloat(document.getElementById('playbackSpeedInput')?.value || 1);
+    console.log('playbackSpeed',playbackSpeed)
+    const hideUI = document.getElementById('hideUIPanelCheckbox').checked;
+    const showProgress = document.getElementById('showProgressCheckbox').checked;
+
+    if (turns < 1) {
+      alert('Turns must be at least 1');
+      return;
+    }
+    if (clickDelay < 10) {
+      alert('Delay must be at least 10 ms');
+      return;
+    }
+    if (format === 'mp4') {
+      clickDelay = 100;
+      if (playbackSpeed <= 0) {
+        alert('Playback Speed must be greater than 0');
+        return;
+      }
+    }
+
+    if (hideUI) {
+      panel.style.display = 'none';
+      await new Promise(res => setTimeout(res, 100));
+    }
+
+    if (format === 'gif') {
+      await loadGifLib();
+      await captureTurnsAsGif(turns, clickDelay, showProgress);
+    } else if (format === 'mp4') {
+      const adjustedClickDelay = clickDelay / playbackSpeed;
+      await captureTurnsAsMP4(turns, adjustedClickDelay, playbackSpeed, showProgress);
+    }
+
+    if (hideUI) {
+      panel.style.display = 'block';
+    }
+  };
+
+  // --- GIF capture function (your stable version with optional progress overlay) ---
+  async function captureTurnsAsGif(turns, delayAfterClick, showProgressOverlay) {
+    const nextBtn = Array.from(document.querySelectorAll('#replay-bottom-bar .unselectable'))
+      .find(el => el.innerText.includes('Next Move'));
+    if (!nextBtn) {
+      console.error("❌ Could not find the 'Next Move' button.");
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = document.documentElement.getBoundingClientRect();
+    const width = Math.ceil(rect.width);
+    const height = Math.ceil(rect.height);
+    const scaledWidth = Math.ceil(width * dpr);
+    const scaledHeight = Math.ceil(height * dpr);
+
+    const gif = new GIF({
+      workerScript: window.gifWorkerBlobUrl,
+      workers: 2,
+      quality: 10,
+      width: scaledWidth,
+      height: scaledHeight,
+    });
+
+    let overlay = null;
+    if (showProgressOverlay) {
+      overlay = document.createElement('div');
+      overlay.style.position = 'fixed';
+      overlay.style.bottom = '20px';
+      overlay.style.left = '20px';
+      overlay.style.padding = '10px 15px';
+      overlay.style.background = 'rgba(0, 0, 0, 0.8)';
+      overlay.style.color = '#00ffcc';
+      overlay.style.fontSize = '16px';
+      overlay.style.fontFamily = 'monospace';
+      overlay.style.borderRadius = '8px';
+      overlay.style.zIndex = '999999';
+      overlay.innerText = 'Initializing...';
+      document.body.appendChild(overlay);
+    }
+
+    for (let i = 0; i < turns; i++) {
+      if (overlay) overlay.innerText = `➡️ Advancing turn ${i + 1}/${turns}`;
+      nextBtn.click();
+      await new Promise(res => setTimeout(res, delayAfterClick));
+
+      const canvas = await html2canvas(document.body, {
+        width,
+        height,
+        windowWidth: width,
+        windowHeight: height,
+        scrollX: 0,
+        scrollY: 0,
+        scale: dpr,
+      });
+
+      const img = new Image();
+      img.src = canvas.toDataURL('image/png');
+
+      await new Promise(resolve => {
+        img.onload = () => {
+          gif.addFrame(img, { delay: delayAfterClick });
+          if (overlay) overlay.innerText = `📸 Captured frame ${i + 1}`;
+          resolve();
+        };
+      });
+    }
+
+    if (overlay) overlay.innerText = 'Rendering GIF... 0%';
+    gif.on('progress', p => {
+      if (overlay) overlay.innerText = `Rendering GIF... ${Math.floor(p * 100)}%`;
+    });
+
+    gif.on('finished', blob => {
+      if (overlay) overlay.remove();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'turns.gif';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      console.log("✅ GIF download complete.");
+    });
+
+    gif.render();
+  }
+
+  // --- MP4 capture function with speed and progress overlay option ---
+  async function captureTurnsAsMP4(turns, delayAfterClick, playbackSpeed, showProgressOverlay) {
+    const nextBtn = Array.from(document.querySelectorAll('#replay-bottom-bar .unselectable'))
+      .find(el => el.innerText.includes('Next Move'));
+    if (!nextBtn) {
+      console.error("❌ Could not find the 'Next Move' button.");
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = document.documentElement.getBoundingClientRect();
+    const width = Math.ceil(rect.width);
+    const height = Math.ceil(rect.height);
+
+    // Create hidden canvas to draw frames
+    const canvas = document.createElement('canvas');
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    // Calculate FPS for capture stream
+    const fps = Math.min(60, Math.max(1, Math.round(1000 / delayAfterClick)));
+    const stream = canvas.captureStream(fps);
+
+    // Try mp4 codec (may vary by browser)
+    let options = { mimeType: 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"' };
+    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+      // Fallback to webm if mp4 not supported
+      options = { mimeType: 'video/webm; codecs=vp8' };
+      console.warn("MP4 not supported, falling back to WebM.");
+    }
+    const mediaRecorder = new MediaRecorder(stream, options);
+
+    const chunks = [];
+    mediaRecorder.ondataavailable = e => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+
+    let overlay = null;
+    if (showProgressOverlay) {
+      overlay = document.createElement('div');
+      overlay.style.position = 'fixed';
+      overlay.style.bottom = '20px';
+      overlay.style.left = '20px';
+      overlay.style.padding = '10px 15px';
+      overlay.style.background = 'rgba(0, 0, 0, 0.8)';
+      overlay.style.color = '#00ffcc';
+      overlay.style.fontSize = '16px';
+      overlay.style.fontFamily = 'monospace';
+      overlay.style.borderRadius = '8px';
+      overlay.style.zIndex = '999999';
+      overlay.innerText = 'Initializing...';
+      document.body.appendChild(overlay);
+    }
+
+    mediaRecorder.onstop = () => {
+      if (overlay) overlay.remove();
+      const blobType = options.mimeType.startsWith('video/mp4') ? 'video/mp4' : 'video/webm';
+      const blob = new Blob(chunks, { type: blobType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = blobType === 'video/mp4' ? 'recording.mp4' : 'recording.webm';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      console.log(`✅ ${blobType.toUpperCase()} recording complete.`);
+    };
+
+    mediaRecorder.start();
+
+    for (let i = 0; i < turns; i++) {
+      if (overlay) overlay.innerText = `➡️ Advancing turn ${i + 1}/${turns}`;
+      nextBtn.click();
+      await new Promise(res => setTimeout(res, delayAfterClick));
+
+      const snapshot = await html2canvas(document.body, {
+        width,
+        height,
+        windowWidth: width,
+        windowHeight: height,
+        scrollX: 0,
+        scrollY: 0,
+        scale: dpr,
+        backgroundColor: null,
+      });
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(snapshot, 0, 0, width, height);
+
+      if (overlay) overlay.innerText = `📸 Captured frame ${i + 1}`;
+    }
+
+    if (overlay) overlay.innerText = '🛠 Finalizing video...';
+    mediaRecorder.stop();
+
+    // Wait to finalize video
+    await new Promise(res => setTimeout(res, 2000));
+  }
+})();
