@@ -1,0 +1,878 @@
+// ==UserScript==
+// @name         [global] FFA Global Chatlog Display
+// @namespace    http://tampermonkey.net/
+// @version      2026-09-13
+// @description  Fetch and display chat messages from all FFA replays globally.
+// @author       b1mber
+// @match        https://generals.io/profiles/*
+// @match        https://*.generals.io/profiles/*
+// @require      https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.4.4/lz-string.min.js
+// @grant        none
+// @icon         https://generals.io/favicon/favicon-32x32.png
+// ==/UserScript==
+
+
+/* ============================================================
+ * DISPLAY SETTINGS
+ * ============================================================ */
+
+var ChatLog = document.createElement("span");
+
+ChatLog.id = "ChatLog";
+ChatLog.style.position = "absolute";
+ChatLog.style.overflowY = "scroll";
+ChatLog.style.whiteSpace = "pre-wrap";
+ChatLog.style.top = "10%";
+ChatLog.style.right = "2em";
+ChatLog.style.width = "30%";
+ChatLog.style.background = "#008080";
+ChatLog.style.color = "white";
+ChatLog.style.maxHeight = "70%";
+ChatLog.style.padding = "0.25% 0.5%";
+ChatLog.style.borderStyle = "solid";
+ChatLog.style.fontFamily = "monospace";
+ChatLog.style.zIndex = "999999";
+ChatLog.style.cursor = "default";
+
+document.getElementsByTagName("body")[0].appendChild(ChatLog);
+
+
+/* ============================================================
+ * DRAGGABLE WINDOW
+ * ============================================================ */
+
+function makeDraggable(el) {
+
+    let isDragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    el.addEventListener("mousedown", function(e) {
+
+        isDragging = true;
+
+        offsetX = e.clientX - el.offsetLeft;
+        offsetY = e.clientY - el.offsetTop;
+
+        el.style.cursor = "move";
+    });
+
+    document.addEventListener("mousemove", function(e) {
+
+        if (isDragging) {
+
+            el.style.left =
+                `${e.clientX - offsetX}px`;
+
+            el.style.top =
+                `${e.clientY - offsetY}px`;
+        }
+    });
+
+    document.addEventListener("mouseup", function() {
+
+        isDragging = false;
+        el.style.cursor = "default";
+    });
+}
+
+makeDraggable(ChatLog);
+
+
+/* ============================================================
+ * SERVER CONFIGURATION
+ * ============================================================ */
+
+let serverPrefix = "";
+let amazonPrefix = "";
+
+switch (window.location.hostname) {
+
+    case "eu.generals.io":
+
+        serverPrefix = "https://eu.generals.io/";
+        amazonPrefix =
+            "https://generalsio-replays-eu.s3.amazonaws.com/";
+
+        break;
+
+    case "bot.generals.io":
+
+        serverPrefix = "https://bot.generals.io/";
+        amazonPrefix =
+            "https://generalsio-replays-bot.s3.amazonaws.com/";
+
+        break;
+
+    default:
+
+        serverPrefix = "https://generals.io/";
+        amazonPrefix =
+            "https://generalsio-replays-na.s3.amazonaws.com/";
+
+        break;
+}
+
+
+/* ============================================================
+ * SETTINGS
+ * ============================================================ */
+
+// Number of replays requested per API call.
+const CONST_CHUNK_SIZE = 200;
+
+// Stop after offset reaches 10,000.
+const MAX_OFFSET = 10000;
+
+// Delay between individual .gior downloads.
+const WAIT_N_SECONDS_TO_FETCH_GIOR = 0.005;
+
+// Delay between /api/replays requests.
+const WAIT_N_SECONDS_TO_FETCH_REPLAYS = 0.02;
+
+// Display the chat window.
+const SETTINGS_DISPLAY_WINDOW = true;
+
+// Export chat logs to console.
+const SETTINGS_EXPORT_CHATLIST = true;
+
+// Optional username/turn alignment.
+const SETTING_HACK_ALIGNMENT = false;
+
+const CONST_USERNAME_MAX_LEN = 19;
+
+
+/* ============================================================
+ * MESSAGE COLORS
+ * ============================================================ */
+
+/*
+ * The color is NOT random.
+ *
+ * A simple hash of the username determines the color.
+ * Therefore:
+ *
+ *     "PlayerA" -> always the same color
+ *
+ * during the entire run.
+ *
+ * Different usernames can collide and receive the same
+ * color because there are only 7 colors.
+ */
+
+const MESSAGE_COLORS = [
+    "#ffff00", // yellow
+    "#00ffff", // cyan
+    "#ff80ff", // pink
+    "#80ff80", // green
+    "#ffb366", // orange
+    "#b3b3ff", // lavender
+    "#ffffff"  // white
+];
+
+
+function getUsernameColor(username) {
+
+    let hash = 0;
+
+    for (let i = 0; i < username.length; i++) {
+
+        hash =
+            ((hash << 5) - hash) +
+            username.charCodeAt(i);
+
+        hash |= 0;
+    }
+
+    return MESSAGE_COLORS[
+        Math.abs(hash) % MESSAGE_COLORS.length
+    ];
+}
+
+
+/* ============================================================
+ * FETCH GLOBAL FFA REPLAYS
+ * ============================================================ */
+
+async function replays(offset, count) {
+
+    var xmlhttp = new XMLHttpRequest();
+
+    var url =
+        `${serverPrefix}api/replays` +
+        `?offset=${offset}` +
+        `&count=${count}` +
+        `&l=ffa`;
+
+    console.log("calling url:", url);
+
+    return new Promise((resolve, reject) => {
+
+        xmlhttp.open("GET", url, true);
+
+        xmlhttp.onreadystatechange = function() {
+
+            if (this.readyState != 4)
+                return;
+
+            if (this.status == 200) {
+
+                try {
+
+                    resolve(
+                        JSON.parse(this.responseText)
+                    );
+
+                } catch (e) {
+
+                    reject(e);
+                }
+
+            } else {
+
+                reject(
+                    "Failed to fetch replay list: status " +
+                    this.status
+                );
+            }
+        };
+
+        xmlhttp.send();
+    });
+}
+
+
+/* ============================================================
+ * GET INDIVIDUAL .GIOR REPLAY
+ * ============================================================ */
+
+function getReplay(replayId) {
+
+    return new Promise((resolve, reject) => {
+
+        var xmlhttp = new XMLHttpRequest();
+
+        xmlhttp.open(
+            "GET",
+            amazonPrefix + replayId + ".gior",
+            true
+        );
+
+        xmlhttp.onreadystatechange = function() {
+
+            if (this.readyState != 4)
+                return;
+
+            if (this.status == 200) {
+
+                try {
+
+                    let gior =
+                        JSON.parse(
+                            LZString.decompressFromUint8Array(
+                                new Uint8Array(this.response)
+                            )
+                        );
+
+                    let usernames = gior[4];
+                    let chat = gior[17];
+
+
+                    /*
+                     * Some old replays may have no chat data.
+                     */
+
+                    if (!chat || chat.length === 0) {
+
+                        resolve([]);
+
+                        return;
+                    }
+
+
+                    /* --------------------------------------------
+                     * Optional alignment hack
+                     * -------------------------------------------- */
+
+                    if (SETTING_HACK_ALIGNMENT) {
+
+                        let CONST_LAST_MESSAGE_TURN =
+                            chat[chat.length - 1][3];
+
+                        let CONST_LAST_MESSAGE_TURN_LEN =
+                            CONST_LAST_MESSAGE_TURN
+                                .toString()
+                                .length;
+
+                        let CONST_LONGEST_CHAT_NAME =
+                            Math.max(
+                                ...chat.map(tuple => {
+
+                                    let name =
+                                        usernames[tuple[2]];
+
+                                    return name
+                                        ? name.length
+                                        : 0;
+                                })
+                            );
+
+                        CONST_LONGEST_CHAT_NAME =
+                            Math.min(
+                                CONST_USERNAME_MAX_LEN,
+                                CONST_LONGEST_CHAT_NAME
+                            );
+
+                        let parsechat =
+                            chat.map(tuple => {
+
+                                let username =
+                                    usernames[tuple[2]];
+
+                                if (username === undefined)
+                                    username = "UNKNOWN";
+
+                                return [
+                                    username.padEnd(
+                                        CONST_LONGEST_CHAT_NAME,
+                                        " "
+                                    ),
+
+                                    tuple[3]
+                                        .toString()
+                                        .padEnd(
+                                            CONST_LAST_MESSAGE_TURN_LEN,
+                                            " "
+                                        ),
+
+                                    tuple[0],
+                                    tuple[1]
+                                ];
+                            });
+
+                        resolve(parsechat);
+
+                    } else {
+
+                        let parsechat =
+                            chat.map(tuple => {
+
+                                let username =
+                                    usernames[tuple[2]];
+
+                                if (username === undefined)
+                                    username = "UNKNOWN";
+
+                                return [
+                                    username,
+                                    tuple[3].toString(),
+                                    tuple[0],
+                                    tuple[1]
+                                ];
+                            });
+
+                        resolve(parsechat);
+                    }
+
+                } catch (e) {
+
+                    reject(e);
+                }
+
+            } else {
+
+                reject(
+                    "Failed to fetch replay: status " +
+                    this.status
+                );
+            }
+        };
+
+        xmlhttp.responseType = "arraybuffer";
+
+        xmlhttp.send();
+    });
+}
+
+
+/* ============================================================
+ * LOG SETTINGS
+ * ============================================================ */
+
+console.log(
+    "settings",
+    "MAX_OFFSET",
+    MAX_OFFSET,
+    "CONST_CHUNK_SIZE",
+    CONST_CHUNK_SIZE,
+    "WAIT_N_SECONDS_TO_FETCH_GIOR",
+    WAIT_N_SECONDS_TO_FETCH_GIOR,
+    "WAIT_N_SECONDS_TO_FETCH_REPLAYS",
+    WAIT_N_SECONDS_TO_FETCH_REPLAYS,
+    "SETTINGS_DISPLAY_WINDOW",
+    SETTINGS_DISPLAY_WINDOW,
+    "SETTINGS_EXPORT_CHATLIST",
+    SETTINGS_EXPORT_CHATLIST,
+    "SETTING_HACK_ALIGNMENT",
+    SETTING_HACK_ALIGNMENT
+);
+
+
+if (SETTINGS_DISPLAY_WINDOW) {
+
+    let firstnode =
+        document.createElement("a");
+
+    firstnode.innerHTML =
+        `<span style="color: orange">` +
+        `GLOBAL FFA CHATLOG<br>` +
+        `Fetching up to ${MAX_OFFSET.toLocaleString()} replays...` +
+        `<br>` +
+        `Batch size: ${CONST_CHUNK_SIZE}` +
+        `</span>`;
+
+    ChatLog.appendChild(firstnode);
+}
+
+
+/* ============================================================
+ * MAIN LOOP
+ * ============================================================ */
+
+let OFFSET = 0;
+
+let exportChatList = [];
+
+let progressBar = [
+    [0, new Date()]
+];
+
+let totalGamesProcessed = 0;
+let totalGamesWithChat = 0;
+let totalMessages = 0;
+
+
+while (OFFSET < MAX_OFFSET) {
+
+    let replayList;
+
+
+    /* ========================================================
+     * FETCH NEXT 200 REPLAYS
+     * ======================================================== */
+
+    try {
+
+        replayList =
+            await replays(
+                OFFSET,
+                CONST_CHUNK_SIZE
+            );
+
+    } catch (err) {
+
+        console.error(
+            "Failed to fetch replay batch at offset",
+            OFFSET,
+            err
+        );
+
+        /*
+         * Wait one second before retrying.
+         */
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 1000)
+        );
+
+        continue;
+    }
+
+
+    /* ========================================================
+     * END OF REPLAY LIST
+     * ======================================================== */
+
+    if (!replayList ||
+        replayList.length === 0) {
+
+        console.log(
+            "No more replays at offset",
+            OFFSET
+        );
+
+        break;
+    }
+
+
+    console.log(
+        `Fetched ${replayList.length} replays at offset ${OFFSET}`
+    );
+
+
+    /* ========================================================
+     * PROCESS EACH REPLAY
+     * ======================================================== */
+
+    for (let i = 0;
+         i < replayList.length;
+         i++) {
+
+        let replay = replayList[i];
+
+        let replayId = replay.id;
+
+        let ladderType = replay.type;
+
+        let started =
+            new Date(replay.started);
+
+
+        if (!replayId) {
+
+            console.warn(
+                "Replay has no ID:",
+                replay
+            );
+
+            continue;
+        }
+
+
+        /*
+         * IMPORTANT:
+         *
+         * gameNumber is based on OFFSET + i + 1.
+         *
+         * It is calculated for EVERY game, including games
+         * that have zero messages.
+         *
+         * Therefore skipping a zero-message game does NOT
+         * affect numbering.
+         */
+
+        let gameNumber =
+            OFFSET + i + 1;
+
+
+        /* ====================================================
+         * FETCH CHAT
+         * ==================================================== */
+
+        try {
+
+            let parsechat =
+                await getReplay(replayId);
+
+
+            totalGamesProcessed++;
+
+
+            /* =================================================
+             * SKIP GAMES WITH ZERO MESSAGES
+             * =================================================
+             *
+             * No header.
+             * No output.
+             * No export.
+             *
+             * But gameNumber continues to be based on the
+             * original OFFSET + i + 1.
+             */
+
+            if (parsechat.length === 0) {
+
+                console.log(
+                    "Skipping game with messages=0:",
+                    replayId,
+                    "game#" + gameNumber
+                );
+
+                /*
+                 * Still wait between .gior requests.
+                 */
+
+                await new Promise(resolve =>
+                    setTimeout(
+                        resolve,
+                        WAIT_N_SECONDS_TO_FETCH_GIOR * 1000
+                    )
+                );
+
+                continue;
+            }
+
+
+            /* =================================================
+             * THIS GAME HAS CHAT
+             * ================================================= */
+
+            totalGamesWithChat++;
+
+            totalMessages +=
+                parsechat.length;
+
+
+            /* =================================================
+             * DISPLAY
+             * ================================================= */
+
+            if (SETTINGS_DISPLAY_WINDOW) {
+
+                let node =
+                    document.createElement("a");
+
+                node.setAttribute(
+                    "href",
+                    `${serverPrefix}replays/${replayId}`
+                );
+
+                node.setAttribute(
+                    "target",
+                    "_blank"
+                );
+
+
+                /*
+                 * Replay header.
+                 */
+
+                let appendToInnerHTML =
+                    `<span style="color: yellow">` +
+                    `\n${replayId} ` +
+                    `${ladderType} ` +
+                    `${started} ` +
+                    `game#${gameNumber}` +
+                    ` messages=${parsechat.length}` +
+                    `\n</span>`;
+
+
+                /*
+                 * Every message is displayed.
+                 */
+
+                for (let onemessage of parsechat) {
+
+                    let sender =
+                        onemessage[0];
+
+                    let color =
+                        getUsernameColor(sender);
+
+
+                    appendToInnerHTML +=
+                        `<span style="color: ${color}">` +
+                        `\t${onemessage[0]}` +
+                        `\t${onemessage[1]}` +
+                        `\t${onemessage[2]}` +
+                        `\t${onemessage[3]}` +
+                        `\n</span>`;
+                }
+
+
+                node.innerHTML =
+                    appendToInnerHTML;
+
+                node.style.fontWeight =
+                    "normal";
+
+                node.style.display =
+                    "block";
+
+                node.style.textDecoration =
+                    "none";
+
+                ChatLog.appendChild(node);
+            }
+
+
+            /* =================================================
+             * EXPORT
+             * ================================================= */
+
+            if (SETTINGS_EXPORT_CHATLIST) {
+
+                let exportChatListItem = [];
+
+
+                exportChatListItem.push(
+                    replayId +
+                    " " +
+                    ladderType +
+                    " " +
+                    started +
+                    " game#" +
+                    gameNumber +
+                    " messages=" +
+                    parsechat.length
+                );
+
+
+                for (let onemessage of parsechat) {
+
+                    exportChatListItem.push(
+                        onemessage
+                    );
+                }
+
+
+                exportChatList.push(
+                    exportChatListItem
+                );
+            }
+
+
+        } catch (err) {
+
+            console.error(
+                "Failed to process replay:",
+                replayId,
+                ladderType,
+                started,
+                "game#" + gameNumber
+            );
+
+            console.error(err);
+        }
+
+
+        /* ====================================================
+         * DELAY BETWEEN .GIOR REQUESTS
+         * ==================================================== */
+
+        await new Promise(resolve =>
+            setTimeout(
+                resolve,
+                WAIT_N_SECONDS_TO_FETCH_GIOR * 1000
+            )
+        );
+    }
+
+
+    /* ========================================================
+     * PROGRESS / EXPORT
+     * ======================================================== */
+
+    if (SETTINGS_EXPORT_CHATLIST) {
+
+        console.log(
+            "exportChatList so far...",
+            OFFSET,
+            OFFSET + replayList.length,
+            exportChatList
+        );
+    }
+
+
+    /*
+     * Always advance by 200.
+     *
+     * This is deliberately CONST_CHUNK_SIZE rather than
+     * replayList.length so the game numbering corresponds
+     * exactly to the API offset.
+     */
+
+    OFFSET += CONST_CHUNK_SIZE;
+
+
+    progressBar.push([
+        OFFSET,
+        new Date()
+    ]);
+
+
+    console.log(
+        "progressBar:",
+        OFFSET,
+        (
+            (
+                progressBar[
+                    progressBar.length - 1
+                ][1] -
+                progressBar[0][1]
+            ) / 1000 / 60
+        ),
+        "minutes"
+    );
+
+
+    /*
+     * If fewer than 200 games were returned, we've reached
+     * the end.
+     */
+
+    if (replayList.length < CONST_CHUNK_SIZE) {
+
+        console.log(
+            "Received fewer than",
+            CONST_CHUNK_SIZE,
+            "replays; assuming end of replay list."
+        );
+
+        break;
+    }
+
+
+    /*
+     * Wait before requesting the next batch.
+     */
+
+    await new Promise(resolve =>
+        setTimeout(
+            resolve,
+            WAIT_N_SECONDS_TO_FETCH_REPLAYS * 1000
+        )
+    );
+}
+
+
+/* ============================================================
+ * FINISHED
+ * ============================================================ */
+
+if (SETTINGS_DISPLAY_WINDOW) {
+
+    let lastnode =
+        document.createElement("a");
+
+    lastnode.innerHTML =
+        `<span style="color: blue">` +
+        `<br>` +
+        `========================================` +
+        `<br>` +
+        `GLOBAL CHATLOG FINISHED` +
+        `<br>` +
+        `Replays processed: ${totalGamesProcessed}` +
+        `<br>` +
+        `Games containing chat: ${totalGamesWithChat}` +
+        `<br>` +
+        `Messages: ${totalMessages}` +
+        `<br>` +
+        `Final offset: ${OFFSET}` +
+        `<br>` +
+        `========================================` +
+        `</span>`;
+
+    ChatLog.appendChild(lastnode);
+}
+
+
+console.log(
+    "Global FFA chatlog finished.",
+    {
+        totalGamesProcessed:
+            totalGamesProcessed,
+
+        totalGamesWithChat:
+            totalGamesWithChat,
+
+        totalMessages:
+            totalMessages,
+
+        finalOffset:
+            OFFSET,
+
+        exportChatList:
+            exportChatList
+    }
+);
